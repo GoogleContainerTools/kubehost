@@ -1,0 +1,450 @@
+#!/bin/bash
+# kubehost: expose services using hostPort
+
+# Copyright 2018 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[[ -n "${DEBUG}" ]] && set -x
+
+#set -o pipefail -o noclobber -o nounset #-o errexit
+
+# Trap exit 67 and cascade
+set -E
+trap '[ "$?" -ne 67 ] || exit 67' ERR
+
+usage() {
+  cat <<"EOF"
+Usage:
+  bind <service>             : Create a hostPort deployment and corresponding
+                               firewall rule for a service.
+  unbind <service>           : Delete the hostPort deployment and firewall rule
+                               created with 'bind' for a service.
+  getip <service>            : Show the IP of a service created with 'bind'.
+  create-firewall <service>  : Create a GCP firewall rule for the hostPort
+                               deployment created with 'bind'.
+  delete-firewall <service>  : Delete a GCP firewall rule for the hostPort
+                               deployment created with 'bind'.
+  upgrade <service>          : Convert a service that had a hostPort deployment
+                               exposed with 'bind' to a production loadBalancer
+                               service.
+  downgrade <service>        : Convert a loadBalancer service into a hostPort
+                               deployment.
+  demo                       : Create and bind an example deployment.
+  demo_cleanup               : Delete an example deployment.
+  version                    : Display version information.
+  -h,--help                  : Show this message.
+Options:
+  --skip-firewall, -s        : For 'bind' and 'unbind', doesn't modify firewall
+                               rules.
+  --firewall-node-only       : By default, firewall rules are applied to all
+                               nodes on the cluster due to the fact that the
+                               deployment may move around. This flag will create
+                               a specific firewall rule for the node only.
+EOF
+  exit 1
+}
+
+# Logs to stderr.
+# @param {string*} Text to echo to stderr
+echoerr() { echo "$@" 1>&2; }
+
+# Validates if the Kubernetes service exists.
+# @param {string} name of the Kubernetes service
+# @return 67 if the service doesn't exist
+validate_service_exists() {
+  declare -r service=$1
+  kubectl get service ${service}
+  if [ $? -ne 0 ]; then
+    exit 67
+  fi
+}
+
+# Validates that the given Kubernetes service can be used with hostPort.
+# @param {string} name of the Kubernetes service to test
+# @return 67 if invalid, otherwise 0
+validate_service_for_bind() {
+  declare -r service=$1
+  validate_service_exists "${service}"
+  declare -r service_type="$(kubectl get service ${service} -o=jsonpath='{.spec.type}')"
+
+  if [[ "${service_type}" == "LoadBalancer" ]]; then
+    echoerr "Service '${service}' is of type LoadBalancer, you don't need" \
+            "to bind it to the host."
+    exit 67
+  fi
+
+  if [[ "${service_type}" == "NodePort" ]]; then
+    echoerr "Service '${service}' is of type NodePort which is not" \
+            "supported."
+    echoerr "Use ClusterIP with the port you wish to expose, as kubehost" \
+            "will expose that same port via a hostPort deployment."
+    exit 67
+  fi
+}
+
+# Validates that the given Kubernetes service can be upgraded to type
+# LoadBalancer.
+# @param {string} name of the Kubernetes service to validate
+# @return 67 if invalid, otherwise 0
+validate_service_for_upgrade() {
+  declare -r service=$1
+  validate_service_exists "${service}"
+  declare -r service_type="$(kubectl get service ${service} -o=jsonpath='{.spec.type}')"
+
+  if [[ "${service_type}" != "ClusterIP" ]]; then
+    echoerr "This command expects the service '${service}' to be of" \
+            "ClusterIP type."
+    exit 67
+  fi
+}
+
+# Validates that the given Kubernetes service can be downgraded to type
+# hostPort.
+# @param {string} name of the Kubernetes service to validate
+# @return 67 if invalid, otherwise 0
+validate_service_for_downgrade() {
+  declare -r service=$1
+  validate_service_exists "${service}"
+  declare -r service_type="$(kubectl get service ${service} -o=jsonpath='{.spec.type}')"
+
+  if [[ "${service_type}" != "LoadBalancer" ]]; then
+    echoerr "This command expects the service '${service}' to be of" \
+            "LoadBalancer type."
+    exit 67
+  fi
+}
+
+# Generates the hostPort deployment name for a given service.
+# @param {string} name of the Kubernetes service
+# @print the generated hostport deployment name
+generate_deployment_name_for_service() {
+  declare -r service=$1
+  declare -r deployment="${service}-hostport"
+  echo "${deployment}"
+}
+
+# Creates a deployment with a hostPort matching the service's port. Note only
+# the first port is used if the service has multiple ports.
+# @param {string} name of the service to expose
+# @print the name of the deployment that was created
+expose_service() {
+  declare -r service=$1
+  declare -r deployment="$(generate_deployment_name_for_service ${service})"
+  declare -r service_port="$(kubectl get service ${service} -o=jsonpath='{.spec.ports[0].port}')"
+  declare -r service_protocol="$(kubectl get service ${service} -o=jsonpath='{.spec.ports[0].protocol}')"
+  echoerr "Creating hostPort deployment '${deployment}' for service" \
+          "'${service}' (${service_protocol}:${service_port})."
+  declare -r overrides="
+      {
+        \"spec\": {
+          \"template\":{
+            \"spec\": {
+              \"containers\": [{
+                \"name\":\"${deployment}\",
+                \"image\":\"gcr.io/google_containers/proxy-to-service:v2\",
+                \"args\":[
+                    \"${service_protocol}\",
+                    \"${service_port}\",
+                    \"${service}\"],
+                \"ports\":[{
+                    \"protocol\": \"${service_protocol}\",
+                    \"containerPort\": "${service_port}",
+                    \"hostPort\": "${service_port}"
+                  }],
+                \"resources\": {
+                  \"requests\": {
+                    \"cpu\": \"10m\",
+                    \"memory\": \"10Mi\"
+                  }
+                }
+              }]
+            }
+          }
+        }
+      }"
+
+  kubectl run "${deployment}" \
+      --image=gcr.io/google_containers/proxy-to-service:v2 \
+      --overrides="${overrides}" 1>&2
+
+  echo "${deployment}"
+}
+
+# Waits until the given deployment has at least 1 replica available.
+# @param {string} name of the deployment to wait for
+# @return 67 if waiting timed out, otherwise 0
+wait_deployment_available() {
+  declare -r deployment=$1
+  local available=-1
+  local counter=0
+  local -r delta=1 limit=120
+  echoerr "Waiting for available replicas of deployment '${deployment}'"
+  while [[ "${available}" -lt 1 ]]; do
+    sleep "${delta}"
+    counter="$((counter + delta))"
+    available="$(kubectl get deployment ${deployment} -o=jsonpath='{.status.availableReplicas}')"
+    if [ "${counter}" -gt "${limit}" ]; then
+      echoerr "No replicas available for deployment '${deployment}'." \
+              "Either it's really slow to deploy, or your hostPort" \
+              "deployment can't be scheduled due to the lack of an" \
+              "available port."
+      exit 67
+    fi
+  done
+}
+
+# Returns the external IP assigned to a service of type loadBalancer.
+# @param {string} name of the service
+# @print The external IP of the service.
+# @return 67 if load balancer is not ready after certain timeout
+get_external_ip() {
+  declare -r service=$1
+  local ip=""
+  local counter=0
+  local -r delta=1 limit=120
+  echoerr "Waiting for load balancer to be configured for service '${service}'"
+  while [[ "${ip}" == "" ]]; do
+    sleep "${delta}"
+    counter="$((counter + delta))"
+    ip="$(kubectl get service ${service} -o=jsonpath='{.status.loadBalancer.ingress[0].ip}')"
+    if [ "${counter}" -gt "${limit}" ]; then
+      echoerr "Failed to get the external IP for service '${service}'."
+      exit 67
+    fi
+  done
+  echo "${ip}"
+}
+
+# Gets the node on which the given deployment was deployed to.
+# @param {string} Name of the deployment to query
+# @print The node on which the deployment was deployed.
+# @return 67 if the deployment was not found or isn't present on any nodes
+get_hostport_deployment_node() {
+  declare -r deployment=$1
+  declare -r host_pod="$(kubectl get pods -o=jsonpath={.items[?\(@.metadata.labels.run==\"${deployment}\"\)].metadata.name})"
+  if [[ ! "${host_pod}" ]]; then
+    echoerr "Deployment '${deployment}' not found, exiting."
+    exit 67
+  fi
+  declare -r node="$(kubectl get pod ${host_pod} -o=jsonpath={.spec.nodeName})"
+  if [[ ! "${node}" ]]; then
+    echoerr "Deployment '${deployment}' is not on any node."
+    exit 67
+  fi
+  echo "${node}"
+}
+
+# Returns the IP address of the node.
+# @param {string} name of the deployment to query
+# @return 67 if waiting timed out, otherwise 0
+get_hostport_deployment_ip() {
+  local -r deployment=$1
+  local -r node="$(get_hostport_deployment_node ${deployment})"
+  local -r ip="$(kubectl get node ${node} -o=jsonpath='{.status.addresses[?(@.type=="ExternalIP")].address}')"
+  echo "$ip"
+}
+
+# Returns 0 if the node appears in the compute instances list.
+# A non-0 result likely indicates the user's gcloud isn't setup correctly.
+# @param {string} name of the node to lookup
+# @return 0 if the node exists, otherwise 1
+validate_gcloud_node() {
+  declare -r node=$1
+  declare -r result="$(gcloud --format='value(name)' compute instances list | grep ${node})"
+  if [[ "${result}" == "${node}" ]]; then
+      return 0
+  fi
+  return 1
+}
+
+# Returns 1 if the given firewall rule already exists, otherwise 0
+# @param {string} Name of the firewall rule to lookup
+# @return 1 if the given firewall rule already exists, otherwise 0
+firewall_rule_exists() {
+  declare -r rule=$1
+  declare -r result="$(gcloud compute firewall-rules list --format=value\(name\) | grep ${rule})"
+  if [[ "${result}" == "${rule}" ]]; then
+    return 1
+  fi
+  return 0
+}
+
+# Creates or destroys a firewall rule.
+# @param {string} the action to be performed, either "create" or "delete"
+# @param {string} the name of the service for which the rule is being created
+# @param {boolean} target only the node of the deployment if 1, otherwise
+#     rule will target all nodes in the cluster
+manage_firewall_rule() {
+  declare -r action=$1
+  declare -r service=$2
+  declare -r create_node_tag="${3:-0}"
+  declare -r deployment="$(generate_deployment_name_for_service ${service})"
+
+  declare -r node="$(get_hostport_deployment_node ${deployment})"
+  validate_gcloud_node "${node}"
+  if [ $? -ne 0 ]; then
+    echoerr "Failed to create a firewall rule because the node ${node}" \
+            "isn't in your gcloud instance list. Run 'gcloud init' and" \
+            "select the project and zone containing the Kubernetes cluster." \
+            "Then run 'kubehost create-firewall ${service}'."
+    return 0
+  fi
+
+  declare -r service_port="$(kubectl get service ${service} -o=jsonpath={.spec.ports[0].port})"
+  declare -r service_protocol="$(kubectl get service ${service} -o=jsonpath={.spec.ports[0].protocol})"
+  declare -r namespace="$(kubectl get service ${service} -o=jsonpath={.metadata.namespace})"
+
+  # Get the GKE instance tag for this cluster
+  declare -r gke_tag="$(gcloud compute instances list --filter=name=\(\"${node}\"\) --flatten=tags.items --format=value\(tags.items\) | grep 'gke.*node')"
+  local tag="${gke_tag}"
+  if [ "${create_node_tag}" -ne 0 ]; then
+    tag="${namespace}-${service}"
+  fi
+  declare -r fwname="${namespace}-${service}-rule"
+  if [[ "${action}" == "create" ]]; then
+    firewall_rule_exists "${fwname}"
+    if [ $? -ne 0 ]; then
+      echoerr "Firewall rule ${fwname} already exists, not recreating."
+      return 1
+    fi
+    echoerr "Creating ingress firewall rule from ${service_protocol}:${service_port} to instances with tag ${tag}."
+    if [ "${create_node_tag}" -ne 0 ]; then
+      gcloud compute instances add-tags "${node}" --tags "${tag}"
+    fi
+    gcloud compute firewall-rules create "${fwname}" --allow "${service_protocol}:${service_port}" --target-tags="${tag}"
+  else
+    echoerr "Deleting firewall rule."
+    if [ "${create_node_tag}" -ne 0 ]; then
+      gcloud compute instances remove-tags "${node}" --tags "${tag}" --quiet
+    fi
+    gcloud compute firewall-rules delete "${fwname}" --quiet
+  fi
+}
+
+demo_cmd() {
+  declare -r cmd=$1
+  local yellow darkbg normal
+  yellow=$(tput setaf 2)
+  darkbg=$(tput setab 0)
+  normal=$(tput sgr0)
+  cur_ctx_fg="${KUBECTX_CURRENT_FGCOLOR:-$yellow}"
+  cur_ctx_bg="${KUBECTX_CURRENT_BGCOLOR:-$darkbg}"
+
+  # Prints the command
+  echo "${cur_ctx_bg}${cur_ctx_fg} ${cmd}${normal}"
+
+  # Evaluates the command
+  ${cmd}
+}
+
+demo() {
+  demo_cmd "kubectl run hello --image gcr.io/google-samples/hello-app:1.0 --port 8080"
+  demo_cmd "kubectl expose deployment hello --port 80 --target-port 8080 --name hello-service"
+  demo_cmd "$0 bind hello-service"
+}
+
+demo_cleanup() {
+  demo_cmd "$0 unbind hello-service"
+  demo_cmd "kubectl delete service hello-service"
+  demo_cmd "kubectl delete deployment hello"
+}
+
+function main() {
+  # Process optional arguments
+  local skipfirewall=0
+  local firewallnodeonly=0
+  args=()
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -s|--skip-firewall) skipfirewall=1; shift 1 ;;
+      --firewall-node-only) firewallnodeonly=1; shift 1 ;;
+      -h|--help) usage; exit 1 ;;
+      -*) echo "unknown option: $1" >&2; exit 1 ;;
+      *) args+=($1); shift 1 ;;
+    esac
+  done
+
+  # Compulsory arguments
+  action="${args[0]}"
+  service="${args[1]}"
+
+  case "${action}" in
+    "demo")
+      demo
+      exit 0
+      ;;
+    "demo_cleanup")
+      demo_cleanup
+      exit 0
+      ;;
+    "version")
+      echo "kubehost version 1.0"
+      exit 0
+      ;;
+  esac
+
+  if [[ ! "${service}" ]]; then
+      usage
+      exit 1
+  fi
+
+  case "${action}" in
+    "bind")
+      validate_service_for_bind "${service}"
+      declare -r deployment="$(expose_service $service)"
+      sleep 1
+      wait_deployment_available "${deployment}"
+      if [ "${skipfirewall}" -ne 1 ]; then
+        manage_firewall_rule "create" "${service}" "${firewallnodeonly}"
+      fi
+      declare -r ip="$(get_hostport_deployment_ip ${deployment})"
+      echo "Service exposed on ${ip}"
+      ;;
+    "create-firewall")
+      manage_firewall_rule "create" "${service}"
+      ;;
+    "delete-firewall")
+      manage_firewall_rule "delete" "${service}"
+      ;;
+    "unbind")
+      declare -r deployment="$(generate_deployment_name_for_service ${service})"
+      if [ "${skipfirewall}" -ne 1 ]; then
+          manage_firewall_rule "delete" "${service}"
+      fi
+      kubectl delete deployment "${deployment}"
+      ;;
+    "getip")
+      declare -r deployment="$(generate_deployment_name_for_service ${service})"
+      declare -r ip="$(get_hostport_deployment_ip ${deployment})"
+      echo "Service exposed on ${ip}"
+      ;;
+    "upgrade")
+      validate_service_for_upgrade "${service}"
+      kubectl patch services ${service} --type='json' -p='[{"op": "replace", "path": "/spec/type", "value":"LoadBalancer"}]'
+      declare -r ip="$(get_external_ip ${service})"
+      echo "Service converted to LoadBalancer type and exposed on ${ip}"
+      $0 unbind ${service}
+      ;;
+    "downgrade")
+      validate_service_for_downgrade "${service}"
+      kubectl patch services ${service} --type='json' -p='[{"op": "replace", "path": "/spec/type", "value":"ClusterIP"},{"op": "remove", "path": "/spec/ports/0/nodePort"}]'
+      $0 bind ${service}
+      ;;
+    *)
+      usage
+      ;;
+  esac
+}
+
+main $@
