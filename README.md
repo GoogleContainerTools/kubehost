@@ -46,7 +46,7 @@ are configured with your desired project & cluster.
 1. run `gcloud init` to select your account, project and region
    containing the GKE cluster.
 2. run 
-(get-credentials)[https://cloud.google.com/sdk/gcloud/reference/container/clusters/get-credentials]
+[get-credentials](https://cloud.google.com/sdk/gcloud/reference/container/clusters/get-credentials)
    to configure `kubectl`.
 
 ## Exposing a Deployment with kubehost
